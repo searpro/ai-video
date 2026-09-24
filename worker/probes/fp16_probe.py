@@ -1,15 +1,19 @@
-"""Is fp16 usable on a T4 for Z-Image, and if so where does it need fp32?
+"""How fast is Z-Image in fp32, and is the P100 the better card for it?
 
-The previous run established:
-  - bf16 is numerically clean on sm75 but SOFTWARE EMULATED: 2.2 TFLOP/s
-    against fp16's 22.9, and 377s for eight steps. Correct and unusable.
-  - so fp16 is the only fast path, and the black image has to be fixed rather
-    than avoided by switching dtype.
+fp16 is a dead end for this model. Chasing the overflow moved it rather than
+fixing it: upcasting the refiner blocks cleared them and it reappeared at
+layers.0.feed_forward.w2. The activations broadly exceed fp16's 65504, which
+is consistent with bf16 (same exponent range as fp32) being clean throughout.
 
-This run builds ONE pipeline (two in a single kernel tripped the host RAM OOM
-killer) in fp16, logs NaN per denoising step to place the blame, then decodes
-the same latents three ways to find the cheapest decode that survives.
+So the question is no longer "how do we get fp16 to work" but "what is the
+cheapest correct dtype". On paper the T4 does 3.9 fp32 TFLOP/s against 2.2 for
+emulated bf16, and the P100 does ~9.3 fp32 with 732GB/s of bandwidth against
+the T4's 320. If that holds, fp32 on a P100 beats every T4 option.
+
+The text encoder stays in fp16 — it was measured clean at absmax 143.9, and in
+fp32 it would not fit alongside the transformer.
 """
+
 
 import json
 import os
@@ -31,7 +35,8 @@ from PIL import Image
 
 OUT = Path("/kaggle/working")
 MODELS = Path("/kaggle/temp/media/models")
-DT = torch.float16
+DT = torch.float32          # the transformer and VAE
+TE_DT = torch.float16       # measured clean, and fp32 would not fit
 report: dict = {}
 
 
@@ -47,7 +52,6 @@ for repo, sub, pats in [
     ("Tongyi-MAI/Z-Image-Turbo", "z-image-turbo",
      ["model_index.json", "vae/*", "scheduler/*", "transformer/config.json", "tokenizer/*", "text_encoder/config.json"]),
 ]:
-    say(f"+ {repo}")
     snapshot_download(repo_id=repo, local_dir=str(MODELS / sub), allow_patterns=pats, max_workers=8)
 
 from diffusers import (AutoencoderKL, FlowMatchEulerDiscreteScheduler, GGUFQuantizationConfig,
@@ -58,86 +62,115 @@ BASE = MODELS / "z-image-turbo"
 PROMPT = ("a village baker in her forties, flour dusted on her apron, warm morning light "
           "through a bakery window, photorealistic portrait, shallow depth of field")
 
-say("building fp16 pipeline")
-t0 = time.time()
+say("building pipeline")
 pipe = ZImagePipeline(
     transformer=ZImageTransformer2DModel.from_single_file(
         str(next((BASE / "gguf").glob("*.gguf"))), config=str(BASE), subfolder="transformer",
         quantization_config=GGUFQuantizationConfig(compute_dtype=DT), dtype=DT),
     text_encoder=AutoModelForCausalLM.from_pretrained(
-        str(BASE / "te"), gguf_file=next((BASE / "te").glob("*.gguf")).name, dtype=DT),
+        str(BASE / "te"), gguf_file=next((BASE / "te").glob("*.gguf")).name, dtype=TE_DT),
     tokenizer=AutoTokenizer.from_pretrained(str(BASE / "tokenizer")),
     vae=AutoencoderKL.from_pretrained(str(BASE), subfolder="vae", dtype=DT),
     scheduler=FlowMatchEulerDiscreteScheduler.from_pretrained(str(BASE), subfolder="scheduler"),
 )
+
+
+def cast_tree(x, dtype):
+    """Cast every floating tensor in a nested structure, leaving the rest alone."""
+    if torch.is_tensor(x):
+        return x.to(dtype) if x.is_floating_point() else x
+    if isinstance(x, tuple):
+        return tuple(cast_tree(i, dtype) for i in x)
+    if isinstance(x, list):
+        return [cast_tree(i, dtype) for i in x]
+    if isinstance(x, dict):
+        return {k: cast_tree(v, dtype) for k, v in x.items()}
+    return x
+
+
+# Bridge the fp16 encoder to the fp32 transformer.
+_orig_encode = pipe.encode_prompt
+
+
+def _encode(*a, **k):
+    out = _orig_encode(*a, **k)
+    return cast_tree(out, DT)
+
+
+pipe.encode_prompt = _encode
+report["dtypes"] = {"transformer": str(DT), "text_encoder": str(TE_DT)}
+say("transformer/vae in", DT, "| text encoder in", TE_DT)
+
 pipe.enable_model_cpu_offload()
 pipe.set_progress_bar_config(disable=True)
-report["build_s"] = round(time.time() - t0)
-say("built in", report["build_s"], "s")
 
-nan_steps, step_times = [], []
-last = [time.time()]
+seen: dict[str, dict] = {}
+
+
+def nonfinite(xs):
+    if torch.is_tensor(xs):
+        return xs.is_floating_point() and bool(torch.isnan(xs).any() or torch.isinf(xs).any())
+    return isinstance(xs, (tuple, list)) and any(nonfinite(x) for x in xs)
+
+
+def absmax(xs):
+    t = xs if torch.is_tensor(xs) else next((x for x in (xs or []) if torch.is_tensor(x)), None)
+    if t is None or not t.is_floating_point():
+        return None
+    f = t[torch.isfinite(t)]
+    return round(f.abs().max().item(), 1) if f.numel() else None
+
+
+def make_hook(name):
+    def fn(mod, inp, out):
+        if name not in seen and nonfinite(out) and not nonfinite(inp):
+            seen[name] = {"type": type(mod).__name__, "in": absmax(inp), "out": absmax(out)}
+    return fn
+
+
+handles = [m.register_forward_hook(make_hook(n)) for n, m in pipe.transformer.named_modules() if n]
+
+nan_steps, times, last = [], [], [time.time()]
 
 
 def tick(_p, i, _t, kw):
     lat = kw.get("latents")
-    step_times.append(round(time.time() - last[0], 1))
-    last[0] = time.time()
+    times.append(round(time.time() - last[0], 1)); last[0] = time.time()
     if lat is not None:
-        bad = bool(torch.isnan(lat).any() or torch.isinf(lat).any())
-        fin = lat[torch.isfinite(lat)]
-        mx = fin.abs().max().item() if fin.numel() else float("nan")
-        say(f"   step {i+1}: nan/inf={bad} absmax={mx:.1f} ({step_times[-1]}s)")
-        if bad:
+        b = bool(torch.isnan(lat).any() or torch.isinf(lat).any())
+        f = lat[torch.isfinite(lat)]
+        say(f"   step {i+1}: nan={b} absmax={f.abs().max().item() if f.numel() else float('nan'):.1f} ({times[-1]}s)")
+        if b:
             nan_steps.append(i + 1)
     return kw
 
 
-say("--- denoising in fp16 ---")
 t0 = time.time()
-lat = pipe(prompt=PROMPT, width=768, height=1024, num_inference_steps=8, guidance_scale=1.0,
-           generator=torch.Generator("cpu").manual_seed(42),
-           callback_on_step_end=tick, output_type="latent").images
-report["denoise_s"] = round(time.time() - t0)
-report["step_times"] = step_times
-report["nan_steps"] = nan_steps
-report["latent_nan"] = bool(torch.isnan(lat).any() or torch.isinf(lat).any())
-say(f"latents NaN: {report['latent_nan']}  in {report['denoise_s']}s")
+try:
+    img = pipe(prompt=PROMPT, width=768, height=1024, num_inference_steps=8, guidance_scale=1.0,
+               generator=torch.Generator("cpu").manual_seed(42),
+               callback_on_step_end=tick, output_type="pil").images[0]
+    report["denoise_s"] = round(time.time() - t0)
+    report["step_times"] = times
+    report["nan_steps"] = nan_steps
+    img.save(OUT / "fp32_transformer.png")
+    a = np.array(img)
+    report["image"] = {"mean": round(float(a.mean()), 2), "std": round(float(a.std()), 2),
+                       "unique": int(len(np.unique(a.reshape(-1, 3), axis=0)))}
+    say("image stats:", report["image"], f"in {report['denoise_s']}s")
+except Exception as e:
+    say("failed:", str(e)[:400])
+    report["error"] = str(e)[:400]
 
-# Free the transformer and encoder before the VAE work; offload hooks leave
-# them resident otherwise and the fp32 VAE needs the room.
-pipe.maybe_free_model_hooks()
-torch.cuda.empty_cache()
-
-scaling = pipe.vae.config.scaling_factor
-
-
-def decode(device, dtype, tag):
-    """Decode the SAME latents and report whether anything survived."""
-    try:
-        t0 = time.time()
-        vae = pipe.vae.to(device=device, dtype=dtype)
-        with torch.no_grad():
-            img = vae.decode((lat.to(device=device, dtype=dtype) / scaling)).sample
-        arr = img.float().cpu().numpy()
-        st = {"s": round(time.time() - t0, 1), "nan": bool(np.isnan(arr).any()),
-              "min": round(float(np.nanmin(arr)), 3), "max": round(float(np.nanmax(arr)), 3),
-              "std": round(float(np.nanstd(arr)), 4)}
-        report[tag] = st
-        say(f"  {tag}: {st}")
-        a = np.nan_to_num(arr[0].transpose(1, 2, 0))
-        Image.fromarray(((a.clip(-1, 1) + 1) * 127.5).astype("uint8")).save(OUT / f"{tag}.png")
-    except Exception as e:
-        say(f"  {tag} failed: {str(e)[:200]}")
-        report[tag] = {"error": str(e)[:200]}
-    torch.cuda.empty_cache()
-
-
-say("--- decoding the same latents three ways ---")
-decode("cuda", torch.float16, "vae_cuda_fp16")
-decode("cuda", torch.float32, "vae_cuda_fp32")
-decode("cpu", torch.float32, "vae_cpu_fp32")
+for h in handles:
+    h.remove()
+report["still_overflowing"] = seen
+say("\n--- still turning finite input into non-finite output ---")
+for k, v in seen.items():
+    say("  ", k, v)
+if not seen:
+    say("   none")
 
 (OUT / "report.json").write_text(json.dumps(report, indent=2))
 say("\n" + "=" * 70)
-say(json.dumps(report, indent=2))
+say(json.dumps(report, indent=2)[:3000])
