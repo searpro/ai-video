@@ -9,10 +9,15 @@ or, without a repo, upload worker/ and run `python kaggle_setup.py`.
 
 It installs what the base image lacks, fetches the weights, starts the worker
 and opens a Cloudflare tunnel, then prints the URL to paste into Viceroy's
-provider rows. Weights are the slow part on a cold session (~20GB), so once a
-run works, snapshot WORKER_MODELS into a private Kaggle Dataset and set
-WORKER_MODELS to its mount path: a dataset is attached instantly and does not
-count against the session clock.
+provider rows.
+
+Everything lands in /kaggle/temp rather than /kaggle/working: the working
+directory is the notebook's saved output and is capped at 20GB, which these
+weights do not fit in. /kaggle/temp is scratch on the same, much larger disk.
+
+Weights are ~17GB on a cold session, so once a run works, save them into a
+private Kaggle Dataset and set WORKER_MODELS to its mount path: a dataset is
+attached instantly and does not spend the session clock.
 """
 
 from __future__ import annotations
@@ -24,8 +29,16 @@ import sys
 import time
 from pathlib import Path
 
-ROOT = Path(os.environ.get("WORKER_ROOT", "/kaggle/working/media"))
+# /kaggle/working has a 20GB quota because it is the saved output; /kaggle/temp
+# is scratch on the same much larger disk and is the only place the weights fit.
+SCRATCH = Path("/kaggle/temp" if Path("/kaggle").exists() else "/tmp")
+ROOT = Path(os.environ.get("WORKER_ROOT", str(SCRATCH / "media")))
 MODELS = Path(os.environ.get("WORKER_MODELS", str(ROOT / "models")))
+
+# Xet is the default transfer path and fails on Kaggle with "File reconstruction
+# error: Background writer channel closed"; the plain CDN does not.
+os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+os.environ.setdefault("HF_HOME", str(SCRATCH / "hf"))
 PORT = os.environ.get("PORT", "8000")
 
 # Only what a Kaggle image does not already carry; torch is preinstalled and
@@ -33,13 +46,25 @@ PORT = os.environ.get("PORT", "8000")
 PIP = ["diffusers>=0.40", "transformers>=4.56", "accelerate", "fastapi", "uvicorn",
        "python-multipart", "imageio", "imageio-ffmpeg", "ftfy", "sentencepiece", "protobuf"]
 
-# repo -> (subdir under MODELS, allow_patterns). Trimmed to inference files:
-# the full repos carry training states and duplicate formats.
-WEIGHTS = {
-    "Tongyi-MAI/Z-Image-Turbo": ("z-image-turbo", None),
-    "Qwen/Qwen-Image-2.1": ("qwen-image-2.1", None),
-    "Wan-AI/Wan2.2-TI2V-5B-Diffusers": ("wan2.2-ti2v-5b", None),
-}
+# Each of these models ships fp32 — about 33GB per repo, over 100GB together,
+# which fits neither the disk nor a 16GB card. So: the transformer comes from a
+# GGUF single file, the text encoder from a GGUF where transformers can read
+# that architecture, and only the small parts (vae, tokenizer, configs) come
+# from the original repo. That is ~17GB for both models.
+#
+# (repo, subdir, allow_patterns) — order matters only for readability.
+WEIGHTS = [
+    # Z-Image Turbo: photoreal stills, 8 steps.
+    ("leejet/Z-Image-Turbo-GGUF", "z-image-turbo/gguf", ["z_image_turbo-Q6_K.gguf"]),
+    ("unsloth/Qwen3-4B-Instruct-2507-GGUF", "z-image-turbo/te", ["Qwen3-4B-Instruct-2507-Q4_K_M.gguf"]),
+    ("Tongyi-MAI/Z-Image-Turbo", "z-image-turbo",
+     ["model_index.json", "vae/*", "scheduler/*", "transformer/config.json", "tokenizer/*", "text_encoder/config.json"]),
+    # Wan 2.2 TI2V-5B: image-to-video, 4-6 steps with the turbo merge.
+    ("hum-ma/Wan2.2-TI2V-5B-Turbo-GGUF", "wan2.2-ti2v-5b/gguf", ["Wan2_2-TI2V-5B-Turbo-Q5_K_M.gguf"]),
+    ("city96/umt5-xxl-encoder-gguf", "wan2.2-ti2v-5b/te", ["umt5-xxl-encoder-Q5_K_M.gguf"]),
+    ("Wan-AI/Wan2.2-TI2V-5B-Diffusers", "wan2.2-ti2v-5b",
+     ["model_index.json", "vae/*", "scheduler/*", "transformer/config.json", "tokenizer/*", "text_encoder/config.json"]),
+]
 
 
 def sh(cmd: str, check: bool = True) -> str:
@@ -58,18 +83,26 @@ def install() -> None:
            "&& chmod +x /usr/local/bin/cloudflared")
 
 
+def free_gb(path: Path) -> float:
+    st = os.statvfs(path)
+    return st.f_bavail * st.f_frsize / 1e9
+
+
 def fetch_weights() -> None:
     from huggingface_hub import snapshot_download
 
     MODELS.mkdir(parents=True, exist_ok=True)
-    for repo, (subdir, patterns) in WEIGHTS.items():
+    print(f"disk free at {MODELS}: {free_gb(MODELS):.0f} GB", flush=True)
+
+    for repo, subdir, patterns in WEIGHTS:
         target = MODELS / subdir
-        if target.exists() and any(target.rglob("*.safetensors")):
-            print(f"= {subdir} already present", flush=True)
+        want = patterns[0] if patterns and "*" not in patterns[0] else None
+        if want and (target / want).exists():
+            print(f"= {subdir}/{want} already present", flush=True)
             continue
         print(f"+ {repo} -> {target}", flush=True)
-        snapshot_download(repo_id=repo, local_dir=str(target), allow_patterns=patterns,
-                          max_workers=8, ignore_patterns=["*.pth", "*.ckpt", "*.onnx"])
+        snapshot_download(repo_id=repo, local_dir=str(target), allow_patterns=patterns, max_workers=8)
+        print(f"  {free_gb(MODELS):.0f} GB free", flush=True)
 
 
 def serve() -> None:

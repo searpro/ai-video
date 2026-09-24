@@ -98,37 +98,69 @@ _loaded: tuple[str, Any] | None = None  # (model id, pipeline) — one at a time
 
 
 def pipeline_for(model: str):
-    """Load a pipeline, evicting whatever else is on the card."""
+    """Load a pipeline, evicting whatever else is on the card.
+
+    Assembled from quantized parts rather than `from_pretrained` on the full
+    repo: these models ship fp32 (~33GB each), which neither a 16GB card nor a
+    notebook's disk can take. The transformer comes from a GGUF single file and
+    the text encoder from a GGUF too where transformers can read that
+    architecture, which puts each model in the 8-9GB range.
+    """
     global _loaded
     if _loaded and _loaded[0] == model:
         return _loaded[1]
 
     if _loaded:
-        del _loaded
         _loaded = None
         gc.collect()
         torch.cuda.empty_cache() if DEVICE == "cuda" else None
 
+    from diffusers import GGUFQuantizationConfig
+
+    quant = GGUFQuantizationConfig(compute_dtype=DTYPE)
+
     if model.startswith("z-image"):
-        from diffusers import ZImagePipeline
+        from diffusers import AutoencoderKL, FlowMatchEulerDiscreteScheduler, ZImagePipeline, ZImageTransformer2DModel
+        from transformers import AutoModelForCausalLM, AutoTokenizer
 
-        pipe = ZImagePipeline.from_pretrained(MODELS / "z-image-turbo", torch_dtype=DTYPE)
-    elif model.startswith("qwen-image"):
-        # The Plus pipeline is the one that takes several reference images and
-        # keeps a face across them; it also serves plain text-to-image.
-        from diffusers import QwenImageEditPlusPipeline
-
-        pipe = QwenImageEditPlusPipeline.from_pretrained(MODELS / "qwen-image-2.1", torch_dtype=DTYPE)
+        base = MODELS / "z-image-turbo"
+        pipe = ZImagePipeline(
+            transformer=ZImageTransformer2DModel.from_single_file(
+                str(next((base / "gguf").glob("*.gguf"))), config=str(base), subfolder="transformer",
+                quantization_config=quant, torch_dtype=DTYPE),
+            text_encoder=AutoModelForCausalLM.from_pretrained(
+                str(base / "te"), gguf_file=next((base / "te").glob("*.gguf")).name, torch_dtype=DTYPE),
+            tokenizer=AutoTokenizer.from_pretrained(str(base / "tokenizer")),
+            vae=AutoencoderKL.from_pretrained(str(base), subfolder="vae", torch_dtype=DTYPE),
+            scheduler=FlowMatchEulerDiscreteScheduler.from_pretrained(str(base), subfolder="scheduler"),
+        )
     elif model.startswith("wan"):
-        from diffusers import AutoencoderKLWan, WanImageToVideoPipeline
+        from diffusers import AutoencoderKLWan, WanImageToVideoPipeline, WanTransformer3DModel
+        from transformers import T5Config, UMT5EncoderModel
 
         base = MODELS / "wan2.2-ti2v-5b"
-        vae = AutoencoderKLWan.from_pretrained(base, subfolder="vae", torch_dtype=DTYPE)
-        pipe = WanImageToVideoPipeline.from_pretrained(base, vae=vae, torch_dtype=DTYPE)
+        te = UMT5EncoderModel.from_pretrained(
+            str(base / "te"), gguf_file=next((base / "te").glob("*.gguf")).name,
+            config=T5Config.from_pretrained(str(base / "text_encoder")), torch_dtype=DTYPE)
+        # The VAE has to exist before the pipeline is built: its scale factor is
+        # read at construction, and a missing one silently halves the latent grid.
+        vae = AutoencoderKLWan.from_pretrained(str(base), subfolder="vae", torch_dtype=DTYPE)
+        pipe = WanImageToVideoPipeline.from_pretrained(
+            str(base), transformer=None, vae=vae, text_encoder=te,
+            image_encoder=None, image_processor=None, torch_dtype=DTYPE)
+        pipe.transformer = WanTransformer3DModel.from_single_file(
+            str(next((base / "gguf").glob("*.gguf"))), config=str(base), subfolder="transformer",
+            quantization_config=quant, torch_dtype=DTYPE)
+    elif model.startswith("qwen-image"):
+        # Full precision only: its encoder is Qwen3-VL, which transformers
+        # cannot read from GGUF, so this one needs a card with room for it.
+        from diffusers import QwenImageEditPlusPipeline
+
+        pipe = QwenImageEditPlusPipeline.from_pretrained(str(MODELS / "qwen-image-2.1"), torch_dtype=DTYPE)
     elif model.startswith("ltx"):
         from diffusers import LTXConditionPipeline
 
-        pipe = LTXConditionPipeline.from_pretrained(MODELS / "ltx-0.9.8", torch_dtype=DTYPE)
+        pipe = LTXConditionPipeline.from_pretrained(str(MODELS / "ltx-0.9.8"), torch_dtype=DTYPE)
     else:
         raise ValueError(f"unknown model {model!r}")
 
