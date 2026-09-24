@@ -43,8 +43,13 @@ PORT = os.environ.get("PORT", "8000")
 
 # Only what a Kaggle image does not already carry; torch is preinstalled and
 # reinstalling it would pull a CPU wheel over the CUDA one.
-PIP = ["diffusers>=0.40", "transformers>=4.56", "accelerate", "fastapi", "uvicorn",
-       "python-multipart", "imageio", "imageio-ffmpeg", "ftfy", "sentencepiece", "protobuf"]
+#
+# gguf is not optional here: without it diffusers and transformers both refuse
+# every quantized file with "Unable to load weights from checkpoint file",
+# which reads like a corrupt download rather than a missing package.
+PIP = ["diffusers>=0.40", "transformers>=4.56", "accelerate", "gguf>=0.10.0",
+       "fastapi", "uvicorn", "python-multipart", "imageio", "imageio-ffmpeg",
+       "ftfy", "sentencepiece", "protobuf"]
 
 # Each of these models ships fp32 — about 33GB per repo, over 100GB together,
 # which fits neither the disk nor a 16GB card. So: the transformer comes from a

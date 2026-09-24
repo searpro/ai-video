@@ -36,7 +36,12 @@ from fastapi import FastAPI, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-ROOT = Path(os.environ.get("WORKER_ROOT", "/kaggle/working/media"))
+# /kaggle/working is the notebook's saved output and capped at 20GB, which the
+# weights do not fit in; /kaggle/temp is scratch on the same much larger disk.
+# kaggle_setup.py passes WORKER_ROOT explicitly, so this default only matters
+# when the server is started on its own — it should still land on scratch.
+SCRATCH = Path("/kaggle/temp" if Path("/kaggle").exists() else "/tmp")
+ROOT = Path(os.environ.get("WORKER_ROOT", str(SCRATCH / "media")))
 MODELS = Path(os.environ.get("WORKER_MODELS", str(ROOT / "models")))
 INPUTS, OUTPUTS = ROOT / "inputs", ROOT / "outputs"
 for d in (INPUTS, OUTPUTS, MODELS):
