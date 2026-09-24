@@ -1,0 +1,23 @@
+[project]
+name = "ai-video"
+version = "0.1.0"
+requires-python = ">=3.12"
+dependencies = [
+    "accelerate>=1.15.0",
+    "diffusers>=0.35",
+    "fastapi>=0.141.1",
+    "ftfy>=6.3.1",
+    "gguf>=0.19.0",
+    "huggingface-hub[cli]>=1.32.0",
+    "imageio>=2.37.4",
+    "imageio-ffmpeg>=0.6.0",
+    "peft>=0.21.0",
+    "protobuf>=7.36.2",
+    "python-multipart>=0.0.32",
+    "sentencepiece>=0.2.2",
+    "spandrel>=0.4.2",
+    "torch>=2.14.0",
+    "torchvision>=0.29.0",
+    "transformers>=5.17.0",
+    "uvicorn>=0.53.0",
+]

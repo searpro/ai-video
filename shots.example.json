@@ -1,0 +1,9 @@
+{
+  "fps": 24,
+  "size": 512,
+  "shots": [
+    {"image": "images/test-1.webp", "prompt": "He walks confidently toward the camera down the sunny palm-lined street, arms swinging, warm golden-hour light, cinematic", "frames": 49},
+    {"prompt": "He keeps walking toward the camera as it slowly pushes in, same lighting", "frames": 33, "continue": true},
+    {"image": "images/test-1.webp", "prompt": "Wide shot from behind: he strolls away down the beach road as cars pass, palm trees overhead", "frames": 33, "seed": 7}
+  ]
+}

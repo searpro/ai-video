@@ -1,0 +1,15 @@
+# weights and third-party checkouts: gigabytes, all re-downloadable
+models/
+third_party/
+.venv/
+
+# generated media and scratch inputs
+*.mp4
+*.wav
+*.aiff
+shots_out/
+talking/
+cast/
+images/
+.DS_Store
+test_*.png
