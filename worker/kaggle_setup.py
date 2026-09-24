@@ -35,9 +35,11 @@ SCRATCH = Path("/kaggle/temp" if Path("/kaggle").exists() else "/tmp")
 ROOT = Path(os.environ.get("WORKER_ROOT", str(SCRATCH / "media")))
 MODELS = Path(os.environ.get("WORKER_MODELS", str(ROOT / "models")))
 
-# Xet is the default transfer path and fails on Kaggle with "File reconstruction
-# error: Background writer channel closed"; the plain CDN does not.
-os.environ.setdefault("HF_HUB_DISABLE_XET", "1")
+# Xet stays on: it is several times faster than the plain CDN from a notebook,
+# and the "File reconstruction error: Background writer channel closed" this
+# first hit was Xet's writer running out of disk, not Xet being broken — its
+# cache lives under HF_HOME, which was on the 20GB quota directory. With
+# HF_HOME on scratch there is room for it. Set HF_HUB_DISABLE_XET=1 to opt out.
 os.environ.setdefault("HF_HOME", str(SCRATCH / "hf"))
 PORT = os.environ.get("PORT", "8000")
 
@@ -48,8 +50,8 @@ PORT = os.environ.get("PORT", "8000")
 # every quantized file with "Unable to load weights from checkpoint file",
 # which reads like a corrupt download rather than a missing package.
 PIP = ["diffusers>=0.40", "transformers>=4.56", "accelerate", "gguf>=0.10.0",
-       "fastapi", "uvicorn", "python-multipart", "imageio", "imageio-ffmpeg",
-       "ftfy", "sentencepiece", "protobuf"]
+       "hf_xet", "fastapi", "uvicorn", "python-multipart", "imageio",
+       "imageio-ffmpeg", "ftfy", "sentencepiece", "protobuf"]
 
 # Each of these models ships fp32 — about 33GB per repo, over 100GB together,
 # which fits neither the disk nor a 16GB card. So: the transformer comes from a
@@ -106,7 +108,16 @@ def fetch_weights() -> None:
             print(f"= {subdir}/{want} already present", flush=True)
             continue
         print(f"+ {repo} -> {target}", flush=True)
-        snapshot_download(repo_id=repo, local_dir=str(target), allow_patterns=patterns, max_workers=8)
+        try:
+            snapshot_download(repo_id=repo, local_dir=str(target), allow_patterns=patterns, max_workers=8)
+        except Exception as exc:
+            # Xet is worth keeping for the speed, but when its writer does give
+            # out there is no point failing the whole session over it.
+            if "reconstruction" not in str(exc) and "writer" not in str(exc).lower():
+                raise
+            print(f"  xet failed ({exc}); retrying on the plain CDN", flush=True)
+            os.environ["HF_HUB_DISABLE_XET"] = "1"
+            snapshot_download(repo_id=repo, local_dir=str(target), allow_patterns=patterns, max_workers=8)
         print(f"  {free_gb(MODELS):.0f} GB free", flush=True)
 
 
