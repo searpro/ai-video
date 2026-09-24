@@ -21,6 +21,7 @@ one is evicted, since a 16GB card holds exactly one of these at a time.
 from __future__ import annotations
 
 import gc
+import inspect
 import os
 import threading
 import time
@@ -192,12 +193,18 @@ def run_image(job: Job) -> dict[str, Any]:
 
     kwargs: dict[str, Any] = dict(
         prompt=r.prompt, negative_prompt=r.negative_prompt or None,
-        width=r.width, height=r.height, num_inference_steps=steps, true_cfg_scale=cfg,
+        width=r.width, height=r.height, num_inference_steps=steps,
         generator=torch.Generator(device="cpu").manual_seed(r.seed if r.seed is not None else 42),
         callback_on_step_end=tick,
     )
+    # Qwen-Image calls it true_cfg_scale (guidance_scale there is the distilled
+    # embedding, a different thing); Z-Image and the rest call it
+    # guidance_scale. Ask the pipeline rather than keeping a table per model.
+    accepted = inspect.signature(pipe.__call__).parameters
+    kwargs["true_cfg_scale" if "true_cfg_scale" in accepted else "guidance_scale"] = cfg
     if r.ref_images:
         kwargs["image"] = [load_image(str(INPUTS / n)) for n in r.ref_images]
+    kwargs = {k: v for k, v in kwargs.items() if k in accepted}
 
     out = pipe(**kwargs).images[0]
     name = f"{job.id}.png"
@@ -221,13 +228,17 @@ def run_video(job: Job) -> dict[str, Any]:
         return kw
 
     first = load_image(str(INPUTS / r.image)) if r.image else None
-    out = pipe(
+    kwargs: dict[str, Any] = dict(
         image=first, prompt=r.prompt, negative_prompt=r.negative_prompt or None,
         height=r.height, width=r.width, num_frames=frames, num_inference_steps=steps,
         guidance_scale=r.cfg_scale if r.cfg_scale is not None else 1.0, output_type="pil",
         generator=torch.Generator(device="cpu").manual_seed(r.seed if r.seed is not None else 42),
         callback_on_step_end=tick,
-    ).frames[0]
+    )
+    # Same reason as run_image: these pipelines disagree on their signatures,
+    # and a rejected kwarg here costs a ten minute round trip to find out.
+    accepted = inspect.signature(pipe.__call__).parameters
+    out = pipe(**{k: v for k, v in kwargs.items() if k in accepted}).frames[0]
 
     name = f"{job.id}.mp4"
     export_to_video(out, str(OUTPUTS / name), fps=r.fps, quality=9)
