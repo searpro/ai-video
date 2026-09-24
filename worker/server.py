@@ -31,6 +31,8 @@ from pathlib import Path
 from queue import Queue
 from typing import Any
 
+os.environ.setdefault("PYTORCH_ALLOC_CONF", "expandable_segments:True")
+
 import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, UploadFile
@@ -52,6 +54,11 @@ for d in (INPUTS, OUTPUTS, MODELS):
 # silent 10x slowdown on the T4 Kaggle usually hands out.
 DTYPE = torch.bfloat16 if torch.cuda.is_available() and torch.cuda.get_device_capability()[0] >= 8 else torch.float16
 DEVICE = "cuda" if torch.cuda.is_available() else ("mps" if torch.backends.mps.is_available() else "cpu")
+
+# Cards smaller than this get component offload instead of a resident pipeline.
+# A 16GB T4 reports ~14.6GB usable, so the threshold sits above that and below
+# a 24GB 4090, which holds these models outright.
+OFFLOAD_BELOW = int(os.environ.get("WORKER_OFFLOAD_BELOW_GB", "20")) * 1024**3
 
 
 class JobRequest(BaseModel):
@@ -170,7 +177,18 @@ def pipeline_for(model: str):
     else:
         raise ValueError(f"unknown model {model!r}")
 
-    pipe.to(DEVICE)
+    # Offload rather than pin the whole pipeline to the card. diffusers keeps a
+    # GGUF transformer quantized in VRAM, but transformers DEQUANTIZES a GGUF
+    # text encoder to the compute dtype at load: Qwen3-4B is 2.5GB of Q4_K_M on
+    # disk and ~8GB of fp16 in memory, and umt5-xxl is worse. Together with the
+    # transformer that overruns a 16GB card. Model offload keeps one component
+    # resident at a time, which costs a PCIe transfer per job and fits.
+    if DEVICE == "cuda" and torch.cuda.get_device_properties(0).total_memory < OFFLOAD_BELOW:
+        pipe.enable_model_cpu_offload()
+        if hasattr(getattr(pipe, "vae", None), "enable_tiling"):
+            pipe.vae.enable_tiling()  # decode in tiles; the peak here is the other spike
+    else:
+        pipe.to(DEVICE)
     pipe.set_progress_bar_config(disable=True)
     _loaded = (model, pipe)
     return pipe
