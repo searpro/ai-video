@@ -62,7 +62,11 @@ PIP = ["diffusers>=0.40", "transformers>=4.56", "accelerate", "gguf>=0.10.0",
 # (repo, subdir, allow_patterns) — order matters only for readability.
 WEIGHTS = [
     # Z-Image Turbo: photoreal stills, 8 steps.
-    ("leejet/Z-Image-Turbo-GGUF", "z-image-turbo/gguf", ["z_image_turbo-Q6_K.gguf"]),
+    # unsloth's build, not leejet's: leejet publishes the stable-diffusion.cpp
+    # flavour, which carries no KV metadata and stores cap_pad_token/x_pad_token
+    # as [3840] where diffusers wants [1, 3840]. The ComfyUI-style files keep
+    # the leading dim ([3840, 1] reversed) and declare general.architecture.
+    ("unsloth/Z-Image-Turbo-GGUF", "z-image-turbo/gguf", ["z-image-turbo-Q6_K.gguf"]),
     ("unsloth/Qwen3-4B-Instruct-2507-GGUF", "z-image-turbo/te", ["Qwen3-4B-Instruct-2507-Q4_K_M.gguf"]),
     ("Tongyi-MAI/Z-Image-Turbo", "z-image-turbo",
      ["model_index.json", "vae/*", "scheduler/*", "transformer/config.json", "tokenizer/*", "text_encoder/config.json"]),
@@ -118,6 +122,13 @@ def fetch_weights() -> None:
             print(f"  xet failed ({exc}); retrying on the plain CDN", flush=True)
             os.environ["HF_HUB_DISABLE_XET"] = "1"
             snapshot_download(repo_id=repo, local_dir=str(target), allow_patterns=patterns, max_workers=8)
+        # The server globs *.gguf per directory, so a file left behind by an
+        # earlier run of a different repo would be picked up at random.
+        if want:
+            for stale in target.glob("*.gguf"):
+                if stale.name != want:
+                    print(f"  removing stale {stale.name}", flush=True)
+                    stale.unlink()
         print(f"  {free_gb(MODELS):.0f} GB free", flush=True)
 
 
